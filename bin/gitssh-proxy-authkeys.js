@@ -2,15 +2,15 @@
 'use strict';
 
 const fs = require('fs');
-const { parseConfigFlag, loadConfig } = require('../lib/config');
+const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_CLIENT_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
 const { sendMessage, recvMessage } = require('../lib/protocol');
 const { parseAuthorizedKeys, serializeAuthorizedKeys, transformForProxy, hashKeys } = require('../lib/authkeys');
 
-const log = createLogger('authkeys');
-const { configPath } = parseConfigFlag(process.argv);
-const config = loadConfig(configPath, 'authkeys');
+const { configPath, logFile, logLevel } = parseConfigFlag(process.argv, DEFAULT_CLIENT_CONFIG_PATH);
+const config = loadConfig(configPath, 'client');
+const log = createLogger('authkeys', resolveLogOptions(config, logFile, logLevel));
 
 async function main() {
 	// Read current cache hash if cache exists

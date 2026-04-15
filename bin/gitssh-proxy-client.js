@@ -2,15 +2,16 @@
 'use strict';
 
 const fs = require('fs');
-const { parseConfigFlag, loadConfig } = require('../lib/config');
+const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_CLIENT_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
 const { sendMessage, recvMessage } = require('../lib/protocol');
 const { parseAuthorizedKeys, serializeAuthorizedKeys, transformForProxy, hashKeys } = require('../lib/authkeys');
+const { demux } = require('../lib/mux');
 
-const log = createLogger('client');
-const { configPath, remainingArgs } = parseConfigFlag(process.argv);
+const { configPath, logFile, logLevel, remainingArgs } = parseConfigFlag(process.argv, DEFAULT_CLIENT_CONFIG_PATH);
 const config = loadConfig(configPath, 'client');
+const log = createLogger('client', resolveLogOptions(config, logFile, logLevel));
 
 // The original ForceCommand from the server's authorized_keys
 const cmd = remainingArgs.join(' ');
@@ -72,29 +73,34 @@ async function main() {
 		process.exit(1);
 	}
 
-	// Stream mode: pipe stdio
-	reader.pipe(process.stdout);
-	process.stdin.pipe(writer);
+	// Keep socket half-open: we need to keep reading from the server
+	// (demux) even after stdin ends. allowHalfOpen lets us send our FIN
+	// without tearing down the receive side.
+	socket.allowHalfOpen = true;
 
-	// Handle stream end
-	reader.on('end', () => {
+	// Stream mode: demux stdout+stderr from reader, pipe stdin to writer
+	process.stdin.pipe(writer, { end: false });
+	process.stdin.on('end', () => {
+		// Signal EOF to server without closing the receive side
+		socket.end();
+	});
+
+	demux(reader, process.stdout, process.stderr).then(() => {
 		process.exit(0);
+	}).catch((err) => {
+		log.error(`Stream error: ${err.message}`);
+		process.exit(1);
 	});
 
 	socket.on('error', (err) => {
 		log.error(`Connection error: ${err.message}`);
 		process.exit(1);
 	});
-
-	process.stdin.on('end', () => {
-		socket.end();
-	});
 }
 
 async function updateCache(keysRaw) {
-	const clientPath = loadConfig(configPath, 'authkeys').clientPath;
 	const entries = parseAuthorizedKeys(keysRaw);
-	const transformed = transformForProxy(entries, clientPath);
+	const transformed = transformForProxy(entries, config.clientPath);
 	const content = serializeAuthorizedKeys(transformed);
 
 	// Atomic write: temp file then rename

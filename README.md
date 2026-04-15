@@ -77,27 +77,27 @@ environment variables), and writes the updated cache.
 
 ## Configuration
 
-All binaries read from a JSON config file. Default path:
-`/etc/gitssh-proxy/config.json`. Override with `-C /path/to/config.json`.
+The server and client/authkeys binaries use separate config files. Override
+the default path with `-C /path/to/config.json`.
+
+**`/etc/gitssh-proxy/server.json`** (used by `gitssh-proxy-server`):
 
 ```json
 {
-  "server": {
-    "listen": "0.0.0.0",
-    "port": 9422,
-    "authkeysFile": "/home/git/.ssh/authorized_keys"
-  },
-  "client": {
-    "serverHost": "127.0.0.1",
-    "serverPort": 9422,
-    "cacheFile": "/home/git/.ssh/authorized_keys"
-  },
-  "authkeys": {
-    "serverHost": "127.0.0.1",
-    "serverPort": 9422,
-    "cacheFile": "/home/git/.ssh/authorized_keys",
-    "clientPath": "gitssh-proxy-client"
-  }
+  "listen": "0.0.0.0",
+  "port": 9422,
+  "authkeysFile": "/home/git/.ssh/authorized_keys"
+}
+```
+
+**`/etc/gitssh-proxy/client.json`** (used by `gitssh-proxy-client` and `gitssh-proxy-authkeys`):
+
+```json
+{
+  "serverHost": "127.0.0.1",
+  "serverPort": 9422,
+  "cacheFile": "/home/git/.ssh/authorized_keys",
+  "clientPath": "gitssh-proxy-client"
 }
 ```
 

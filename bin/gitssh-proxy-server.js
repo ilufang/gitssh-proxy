@@ -3,15 +3,16 @@
 
 const net = require('net');
 const fs = require('fs');
-const { parseConfigFlag, loadConfig } = require('../lib/config');
+const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_SERVER_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { wrapTransport } = require('../lib/transport');
 const { sendMessage, recvMessage } = require('../lib/protocol');
 const { parseAuthorizedKeys, findKey, hashKeys } = require('../lib/authkeys');
+const { STDOUT, STDERR, pipeChannel } = require('../lib/mux');
 
-const log = createLogger('server');
-const { configPath, remainingArgs } = parseConfigFlag(process.argv);
+const { configPath, logFile, logLevel } = parseConfigFlag(process.argv, DEFAULT_SERVER_CONFIG_PATH);
 const config = loadConfig(configPath, 'server');
+const log = createLogger('server', resolveLogOptions(config, logFile, logLevel));
 
 // Authorized keys state
 let keysRaw = '';
@@ -107,14 +108,12 @@ function spawnCommand(entry, origcmd, reader, writer, socket, remote) {
 		stdio: ['pipe', 'pipe', 'pipe']
 	});
 
-	// Pipe stdio
+	// Pipe stdin; mux stdout and stderr into the single TCP writer.
+	// Wait for both channels to finish draining before ending the socket,
+	// so all mux frames are sent before the TCP FIN.
 	reader.pipe(child.stdin);
-	child.stdout.pipe(writer);
-
-	// Log stderr on server side
-	child.stderr.on('data', (chunk) => {
-		log.debug(`stderr: ${chunk.toString().trimEnd()}`);
-	});
+	const stdoutDone = pipeChannel(child.stdout, writer, STDOUT).catch(() => {});
+	const stderrDone = pipeChannel(child.stderr, writer, STDERR).catch(() => {});
 
 	child.on('error', (err) => {
 		log.error(`Spawn error: ${err.message}`);
@@ -123,7 +122,7 @@ function spawnCommand(entry, origcmd, reader, writer, socket, remote) {
 
 	child.on('close', (code) => {
 		log.debug(`Child exited with code ${code} for ${remote}`);
-		socket.end();
+		Promise.all([stdoutDone, stderrDone]).then(() => socket.end());
 	});
 
 	socket.on('close', () => {

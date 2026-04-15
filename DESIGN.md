@@ -46,9 +46,24 @@ a single JSON object terminated by `\n`. Multiple operations can be bundled as
 top-level keys in a single message.
 
 After a successful `exec` response, the TCP stream transitions from NDJSON to
-raw binary: the stream becomes the stdio of the spawned process. This means
-the JSON message reader must not consume any bytes beyond the terminating
-newline.
+a multiplexed binary stream carrying both stdout and stderr of the spawned
+process. This means the JSON message reader must not consume any bytes beyond
+the terminating newline.
+
+#### Stream multiplexing
+
+After the `exec` handshake, the stream uses a simple frame format:
+
+```
+[1-byte channel][4-byte big-endian uint32 length][payload bytes]
+```
+
+- Channel `0x01` — stdout
+- Channel `0x02` — stderr
+
+The client demultiplexes frames and routes them to its own `stdout`/`stderr`.
+The server-to-client direction is multiplexed; the client-to-server direction
+(stdin) remains raw binary.
 
 ### getkey
 
