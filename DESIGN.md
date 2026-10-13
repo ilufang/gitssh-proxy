@@ -10,10 +10,10 @@ file). We use this as a fallback behind the cached `authorized_keys` file:
    proceeds immediately.
 2. On cache miss, sshd invokes `AuthorizedKeysCommand` (`gitssh-proxy-authkeys`).
 3. The helper connects to the server and sends a `getkey` request with the
-   hash of the current cache file.
-   - If the server returns updated keys: the helper transforms them (rewrites
-     `command=`, injects `environment=` vars), writes the cache atomically,
-     and outputs the result.
+   etag stored in `<cacheFile>.etag`.
+   - If the server returns updated keys: the helper builds its own
+     `authorized_keys` from them (see below), writes the cache and etag
+     atomically, and outputs the result.
    - If the server returns `notmodified`: the cache is current and the key is
      genuinely not authorized. The helper outputs the existing cache so sshd
      can confirm the miss.
@@ -21,8 +21,30 @@ file). We use this as a fallback behind the cached `authorized_keys` file:
    alongside `exec` to opportunistically refresh the cache.
 
 The user's SSH public key is passed to the client via `environment=` options
-injected into the transformed `authorized_keys` entries. This requires
+in the proxy's `authorized_keys` entries. This requires
 `PermitUserEnvironment GITSSH_PROXY_*` in sshd_config.
+
+## Responsibilities
+
+Only public keys cross the wire between client and server. Each side is
+responsible for its own security and treats the other's data as untrusted:
+
+- **Client (proxy host).** Builds its `authorized_keys` from scratch with
+  fixed, restrictive options; the server cannot influence what runs on the
+  proxy. Whatever passes pubkey auth is forwarded to the server as-is.
+- **Server (git host).** Decides from its own `authorized_keys` and config
+  whether anything runs and what. The key named in a request is just a lookup
+  key; the server never relies on the proxy for its own security.
+
+Residual risk, inherent to a proxy that terminates SSH:
+
+- A compromised proxy (or leaked `psk`) can present any servable key, with
+  any `addr` and any acceptable `origcmd`, since public keys are not secret.
+  It can act as any git user, but only through the git server's own command.
+  `from=` holds only as long as the proxy reports `addr` honestly.
+- A compromised server decides which keys may log in to the proxy and what
+  bytes are relayed to them. Those users can still only run
+  `gitssh-proxy-client`.
 
 ## Transport layer
 
@@ -103,26 +125,31 @@ and 2, sends an EOF frame for each, then sends the `exit` message on channel
 
 ### getkey
 
-Retrieve the server's `authorized_keys`.
+Retrieve the list of public keys the server will serve.
 
 **Request**
 
 ```json
-{"ts": 1760000000, "getkey": {"match": "<sha-256 digest of local cache>"}}
+{"ts": 1760000000, "getkey": {"match": "<etag>"}}
 ```
 
-- `match` (optional): SHA-256 digest of the local `authorized_keys` cache
-  file content. If omitted, the server always returns the full keys.
+- `match` (optional): the `etag` from the last full response, as stored in
+  `<cacheFile>.etag`. If omitted, the server always returns the full list.
 
 **Response**
 
-If the cache is stale or no match was provided:
+If the etag is stale or no match was provided:
 
 ```json
-{"getkey": {"keys": "<authorized_keys file content>"}}
+{"getkey": {"keys": [{"t": "ssh-ed25519", "k": "AAAA..."}], "etag": "<opaque>"}}
 ```
 
-If the provided hash matches the current file:
+- `keys`: servable keys only (see *Server execution policy*), deduplicated.
+  No options, commands or comments.
+- `etag`: opaque to the client. The server uses the SHA-256 base64 digest of
+  the JSON-encoded `keys`.
+
+If `match` equals the current etag:
 
 ```json
 {"getkey": {"notmodified": true}}
@@ -133,23 +160,20 @@ If the provided hash matches the current file:
 Run a command on the server with re-authentication.
 
 Re-authentication is necessary because sshd may have authenticated the user
-against a stale cache. The server verifies the key against its current
-`authorized_keys` before executing.
-
-The server looks up the key by type and data in its own `authorized_keys` to
-determine the correct `command=` to execute. The client-supplied `cmd` field
-is informational and not used for command execution (prevents injection).
+against a stale cache. The server looks the key up in its own current
+`authorized_keys` and runs that entry's `command=`; the client never names a
+command.
 
 **Request**
 
 ```json
-{"ts": 1760000000, "exec": {"t": "<key-type>", "k": "<key-data>", "cmd": "<forcecommand>", "origcmd": "<SSH_ORIGINAL_COMMAND>"}}
+{"ts": 1760000000, "exec": {"t": "<key-type>", "k": "<key-data>", "addr": "<client IP>", "origcmd": "<SSH_ORIGINAL_COMMAND>"}}
 ```
 
 - `t`: SSH key type (e.g., `ssh-rsa`, `ecdsa-sha2-nistp256`, `ssh-ed25519`)
 - `k`: SSH public key data (base64)
-- `cmd`: The original `command=` value from the server's `authorized_keys`
-  (informational; the server uses its own lookup)
+- `addr`: the SSH client's address (first field of `$SSH_CONNECTION`), used
+  for `from=`
 - `origcmd`: The value of `$SSH_ORIGINAL_COMMAND` from the SSH session (e.g.,
   `git-upload-pack 'user/repo.git'`)
 
@@ -161,7 +185,7 @@ On success (stdio streaming on channels 0–2 begins):
 {"exec": {"ok": true}}
 ```
 
-On failure:
+On failure (`Key not authorized` or `Command not allowed`):
 
 ```json
 {"exec": {"error": "<reason>"}}
@@ -180,7 +204,7 @@ The client exits with this code.
 The client typically sends `exec` and `getkey` together in a single message:
 
 ```json
-{"ts": 1760000000, "exec": {"t": "ssh-rsa", "k": "AAAA...", "cmd": "gogs serv key-1", "origcmd": "git-upload-pack 'user/repo.git'"}, "getkey": {"match": "abcdef..."}}
+{"ts": 1760000000, "exec": {"t": "ssh-rsa", "k": "AAAA...", "addr": "203.0.113.5", "origcmd": "git-upload-pack 'user/repo.git'"}, "getkey": {"match": "abcdef..."}}
 ```
 
 The server processes both and returns a single combined response:
@@ -189,28 +213,63 @@ The server processes both and returns a single combined response:
 {"exec": {"ok": true}, "getkey": {"notmodified": true}}
 ```
 
-After this response, stdio streaming begins (if exec succeeded). The client uses the `getkey` result to update its cache
-asynchronously.
+After this response, stdio streaming begins (if exec succeeded). The client uses
+the `getkey` result to update its cache.
 
-## authorized_keys transformation
+## Proxy authorized_keys
 
-Each entry in the server's `authorized_keys` is transformed for the proxy:
+The client writes one line per key from a fixed template:
 
-**Original (server)**:
 ```
-command="/opt/gogs/gogs serv key-1 --config='/opt/gogs/custom/conf/app.ini'",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-rsa AAAA... user@host
-```
-
-**Transformed (proxy)**:
-```
-command="gitssh-proxy-client /opt/gogs/gogs serv key-1 --config='/opt/gogs/custom/conf/app.ini'",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,environment="GITSSH_PROXY_KEY_TYPE=ssh-rsa",environment="GITSSH_PROXY_KEY_DATA=AAAA..." ssh-rsa AAAA... user@host
+restrict,no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,command="<clientPath>",environment="GITSSH_PROXY_KEY_TYPE=<t>",environment="GITSSH_PROXY_KEY_DATA=<k>" <t> <k>
 ```
 
-Changes:
-1. The `command=` value is prefixed with the path to `gitssh-proxy-client`.
-2. `environment="GITSSH_PROXY_KEY_TYPE=<type>"` is appended to the options.
-3. `environment="GITSSH_PROXY_KEY_DATA=<data>"` is appended to the options.
-4. All other options (port forwarding restrictions, etc.) are preserved.
+- A key is kept only if `t` is a known key type (`ssh-ed25519`, `ssh-rsa`,
+  `ecdsa-sha2-nistp{256,384,521}`, `sk-ssh-ed25519@openssh.com`,
+  `sk-ecdsa-sha2-nistp256@openssh.com`) and `k` is strict base64. Anything
+  else from the server is dropped.
+- `clientPath` is restricted to `[A-Za-z0-9._/-]` at config load. No
+  interpolated value can contain `"`, `\`, `,` or whitespace, so no escaping
+  is ever needed.
+- `restrict` (OpenSSH ≥ 7.2) disables forwarding, pty and `~/.ssh/rc`; the
+  explicit `no-*` options are redundant with it.
+- The environment variables let the client send the authenticated key in the
+  `exec` request. This requires `PermitUserEnvironment GITSSH_PROXY_*`.
 
-The environment variables allow the client to retrieve the connecting user's
-SSH key at runtime for the `exec` re-authentication request.
+## Server execution policy
+
+The server mirrors what sshd would allow for the same `authorized_keys`, and
+blocks more only where the operator opts in.
+
+**Servable entries.** On each reload, entries are classified; unservable ones
+are logged and neither advertised by `getkey` nor matched by `exec`:
+
+- no `command=` (over SSH this would be a shell), or more than one;
+- `cert-authority` or `principals=` (a CA key, not a user key);
+- with `allowedCommands` set: a `command=` that does not tokenize, or whose
+  executable is not listed.
+
+`authorized_keys` is not loaded if it is group/world-writable or owned by
+anyone but the server's user or root. The server refuses to run as root.
+
+**Key options.** Checked at `exec` time; as in sshd, the first entry for the
+key whose options allow it is used:
+
+- `expiry-time="YYYYMMDD[HHMM[SS]][Z]"`: denied once past (local time unless
+  `Z`).
+- `from="pattern-list"`: matched against `addr` as sshd does with
+  `UseDNS no`: addresses and CIDR ranges, `*`/`?` globs, and `!` negation
+  (any negated match denies). A missing or invalid `addr` denies.
+- Other options (`no-*`, `restrict`, `environment=`, …) govern the SSH session,
+  which belongs to the proxy, and are ignored.
+
+**Command.** Without `allowedCommands`, `command=` runs through
+`/bin/sh -c`, as sshd would. With it, `command=` is split by a strict
+tokenizer (bare words of `[A-Za-z0-9_@%+=:,./-]`, `'single-quoted'` runs, and
+their concatenation) and run without a shell.
+
+**origcmd.** Must be empty or a single line whose first word matches
+`git-[a-z0-9-]+`; otherwise `exec` fails with `Command not allowed`.
+
+**Environment.** The child gets only `PATH`, `HOME`, `USER`, `LOGNAME`,
+`LANG`, `TZ` from the server's environment, plus `SSH_ORIGINAL_COMMAND`.

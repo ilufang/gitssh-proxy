@@ -1,42 +1,33 @@
 #!/usr/bin/env node
 'use strict';
 
-const fs = require('fs');
 const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_CLIENT_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
 const { sendMessage, recvMessage } = require('../lib/protocol');
-const { parseAuthorizedKeys, serializeAuthorizedKeys, transformForProxy, hashKeys } = require('../lib/authkeys');
+const { buildProxyAuthorizedKeys, writeCache, readEtag } = require('../lib/authkeys');
 const { STDIN, STDOUT, STDERR, CONTROL, pipeChannel } = require('../lib/mux');
 
 const { configPath, logFile, logLevel, remainingArgs } = parseConfigFlag(process.argv, DEFAULT_CLIENT_CONFIG_PATH);
 const config = loadConfig(configPath, 'client');
 const log = createLogger('client', resolveLogOptions(config, logFile, logLevel));
 
-// The original ForceCommand from the server's authorized_keys
-const cmd = remainingArgs.join(' ');
+if (remainingArgs.length > 0) {
+	log.error(`Unexpected arguments: ${JSON.stringify(remainingArgs)}`);
+	process.exit(1);
+}
+
 const origcmd = process.env.SSH_ORIGINAL_COMMAND || '';
 const keyType = process.env.GITSSH_PROXY_KEY_TYPE || '';
 const keyData = process.env.GITSSH_PROXY_KEY_DATA || '';
-
-if (!cmd) {
-	log.error('No command specified');
-	process.exit(1);
-}
+const addr = (process.env.SSH_CONNECTION || '').split(' ')[0];
 
 if (!keyType || !keyData) {
 	log.error('GITSSH_PROXY_KEY_TYPE and GITSSH_PROXY_KEY_DATA must be set');
 	process.exit(1);
 }
 
-// Compute cache file hash
-let cacheHash = '';
-try {
-	const cacheContent = fs.readFileSync(config.cacheFile, 'utf8');
-	cacheHash = hashKeys(cacheContent);
-} catch (err) {
-	// No cache file yet
-}
+const etag = readEtag(config.cacheFile);
 
 async function main() {
 	const { reader, writer, socket } = await connect(config.serverHost, config.serverPort, config.psk);
@@ -51,21 +42,23 @@ async function main() {
 	// Build bundled request
 	const request = {
 		ts: Math.floor(Date.now() / 1000),
-		exec: { t: keyType, k: keyData, cmd, origcmd },
+		exec: { t: keyType, k: keyData, addr, origcmd },
 		getkey: {}
 	};
-	if (cacheHash) {
-		request.getkey.match = cacheHash;
+	if (etag) {
+		request.getkey.match = etag;
 	}
 
 	await sendMessage(writer, request);
 	const response = await recvMessage(reader);
 
-	// Handle getkey response (async, non-blocking)
+	// Refresh the local cache; a failure does not affect this session
 	if (response.getkey && response.getkey.keys) {
-		updateCache(response.getkey.keys).catch((err) => {
+		try {
+			updateCache(response.getkey.keys, response.getkey.etag);
+		} catch (err) {
 			log.debug(`Cache update failed: ${err.message}`);
-		});
+		}
 	}
 
 	// Handle exec response
@@ -113,15 +106,10 @@ async function main() {
 	});
 }
 
-async function updateCache(keysRaw) {
-	const entries = parseAuthorizedKeys(keysRaw);
-	const transformed = transformForProxy(entries, config.clientPath);
-	const content = serializeAuthorizedKeys(transformed);
-
-	// Atomic write: temp file then rename
-	const tmpFile = config.cacheFile + '.tmp.' + process.pid;
-	fs.writeFileSync(tmpFile, content, 'utf8');
-	fs.renameSync(tmpFile, config.cacheFile);
+function updateCache(keys, newEtag) {
+	const { content, dropped } = buildProxyAuthorizedKeys(keys, config.clientPath);
+	if (dropped) log.info(`Dropped ${dropped} invalid keys from server`);
+	writeCache(config.cacheFile, content, newEtag);
 	log.debug(`Updated cache: ${config.cacheFile}`);
 }
 

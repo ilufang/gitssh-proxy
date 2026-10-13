@@ -27,7 +27,10 @@ Shared modules:
 - `lib/transport.js` — AES-128-GCM encrypted frame codec (PSK, per-direction salt)
 - `lib/mux.js` — channel numbers + `pipeChannel` (data frames, then EOF)
 - `lib/protocol.js` — JSON control messages on channel 15 (sendMessage/recvMessage)
-- `lib/authkeys.js` — authorized_keys parsing, serialization, transformation
+- `lib/authkeys.js` — authorized_keys parsing, proxy entry building, cache
+  writing, `from=`/`expiry-time=` checks
+- `lib/command.js` — server exec policy: command tokenizer/allowlist,
+  `origcmd` validation, child environment
 - `lib/connection.js` — TCP connect + transport wrapping
 
 ## Key conventions
@@ -51,5 +54,9 @@ See DESIGN.md. Key points:
   Channels: 0 stdin, 1 stdout, 2 stderr, 15 control (one JSON object/frame).
 - Requests carry `ts`. After `exec` succeeds, stdio flows on channels 0–2,
   then the server sends `{"exit": {"code": n}}`.
-- `getkey` uses SHA-256 caching. `exec` re-authenticates the SSH key.
+- Only public keys cross the wire: `getkey` returns `{keys: [{t, k}], etag}`;
+  the client builds its own restricted `authorized_keys`. `exec` sends
+  `{t, k, addr, origcmd}`; the server looks up and runs its own `command=`.
+- Each side owns its own security: the client never runs server-provided
+  text; the server decides what to execute from its local file and config.
 - Multiple operations can be bundled in a single message.

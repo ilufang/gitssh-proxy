@@ -6,30 +6,30 @@ const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_CLIENT_CONFIG_PA
 const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
 const { sendMessage, recvMessage } = require('../lib/protocol');
-const { parseAuthorizedKeys, serializeAuthorizedKeys, transformForProxy, hashKeys } = require('../lib/authkeys');
+const { buildProxyAuthorizedKeys, writeCache, readEtag } = require('../lib/authkeys');
 
 const { configPath, logFile, logLevel } = parseConfigFlag(process.argv, DEFAULT_CLIENT_CONFIG_PATH);
 const config = loadConfig(configPath, 'client');
 const log = createLogger('authkeys', resolveLogOptions(config, logFile, logLevel));
 
 async function main() {
-	// Read current cache hash if cache exists
-	let cacheHash = '';
+	// Read the etag of the last fetch and the existing cache
+	const etag = readEtag(config.cacheFile);
 	let cacheContent = '';
 	try {
 		cacheContent = fs.readFileSync(config.cacheFile, 'utf8');
-		cacheHash = hashKeys(cacheContent);
 	} catch (err) {
 		// No cache file yet
 	}
 
-	let keysRaw;
+	let keys;
+	let newEtag;
 	try {
 		const { reader, writer, socket } = await connect(config.serverHost, config.serverPort, config.psk);
 
 		const request = { ts: Math.floor(Date.now() / 1000), getkey: {} };
-		if (cacheHash) {
-			request.getkey.match = cacheHash;
+		if (etag) {
+			request.getkey.match = etag;
 		}
 
 		await sendMessage(writer, request);
@@ -38,7 +38,8 @@ async function main() {
 
 		if (response.getkey && response.getkey.keys) {
 			// Cache is stale, got new keys
-			keysRaw = response.getkey.keys;
+			keys = response.getkey.keys;
+			newEtag = response.getkey.etag;
 		} else if (response.getkey && response.getkey.notmodified) {
 			// Cache is current. Key is genuinely not authorized.
 			// Output existing cache for sshd (it will fail to match).
@@ -55,16 +56,20 @@ async function main() {
 		return;
 	}
 
-	// Transform and cache the new keys
-	const entries = parseAuthorizedKeys(keysRaw);
-	const transformed = transformForProxy(entries, config.clientPath);
-	const content = serializeAuthorizedKeys(transformed);
-
-	// Atomic write to cache
+	// Build our own authorized_keys from the key list
+	let content;
 	try {
-		const tmpFile = config.cacheFile + '.tmp.' + process.pid;
-		fs.writeFileSync(tmpFile, content, 'utf8');
-		fs.renameSync(tmpFile, config.cacheFile);
+		const built = buildProxyAuthorizedKeys(keys, config.clientPath);
+		if (built.dropped) log.info(`Dropped ${built.dropped} invalid keys from server`);
+		content = built.content;
+	} catch (err) {
+		log.error(`Invalid key list from server: ${err.message}`);
+		outputFallback(cacheContent);
+		return;
+	}
+
+	try {
+		writeCache(config.cacheFile, content, newEtag);
 		log.debug(`Updated cache: ${config.cacheFile}`);
 	} catch (err) {
 		log.error(`Failed to write cache: ${err.message}`);
