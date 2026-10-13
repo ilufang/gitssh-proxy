@@ -3,8 +3,9 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { PassThrough } = require('stream');
+const crypto = require('crypto');
 const { wrapTransport } = require('../lib/transport');
-const { sendMessage, recvMessage } = require('../lib/protocol');
+const { sendMessage, recvMessage, generateTsNonce, validateTsNonce } = require('../lib/protocol');
 const { STDOUT, STDERR, CONTROL } = require('../lib/mux');
 
 const PSK = 'test-psk';
@@ -151,5 +152,30 @@ describe('transport', () => {
 		const dec = decoder();
 		dec.input.end();
 		await assert.rejects(() => recvMessage(dec.reader), /Connection closed/);
+	});
+});
+
+describe('ts nonce', () => {
+	it('generateTsNonce returns current Unix milliseconds', () => {
+		const ts = generateTsNonce();
+		assert.ok(Number.isInteger(ts));
+		assert.ok(Math.abs(ts - Date.now()) < 2000);
+	});
+
+	it('validateTsNonce accepts a fresh ts and new salt', () => {
+		assert.equal(validateTsNonce(generateTsNonce(), crypto.randomBytes(16)), null);
+	});
+
+	it('validateTsNonce rejects a stale or missing ts', () => {
+		assert.equal(validateTsNonce(generateTsNonce() - 3600 * 1000, crypto.randomBytes(16)), 'stale timestamp');
+		assert.equal(validateTsNonce(generateTsNonce() + 3600 * 1000, crypto.randomBytes(16)), 'stale timestamp');
+		assert.equal(validateTsNonce(undefined, crypto.randomBytes(16)), 'stale timestamp');
+		assert.equal(validateTsNonce(String(generateTsNonce()), crypto.randomBytes(16)), 'stale timestamp');
+	});
+
+	it('validateTsNonce rejects a reused salt', () => {
+		const salt = crypto.randomBytes(16);
+		assert.equal(validateTsNonce(generateTsNonce(), salt), null);
+		assert.equal(validateTsNonce(generateTsNonce(), salt), 'replayed salt');
 	});
 });

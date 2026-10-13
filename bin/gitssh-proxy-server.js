@@ -6,7 +6,7 @@ const fs = require('fs');
 const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_SERVER_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { wrapTransport } = require('../lib/transport');
-const { sendMessage, recvMessage } = require('../lib/protocol');
+const { sendMessage, recvMessage, validateTsNonce } = require('../lib/protocol');
 const { parseAuthorizedKeys, getOption, checkKeyOptions, hashKeys, fingerprint } = require('../lib/authkeys');
 const { resolveCommand, validateOrigCmd, buildChildEnv } = require('../lib/command');
 const { STDIN, STDOUT, STDERR, pipeChannel } = require('../lib/mux');
@@ -103,24 +103,6 @@ function authorizeExec(exec) {
 	return { reason };
 }
 
-// Replay protection: requests must carry a fresh timestamp, and each
-// request salt is accepted only once within the timestamp window.
-const MAX_SKEW = 60; // seconds
-const seenSalts = new Map(); // salt hex -> expiry (insertion order = expiry order)
-
-function checkReplay(ts, salt) {
-	const now = Math.floor(Date.now() / 1000);
-	if (typeof ts !== 'number' || Math.abs(now - ts) > MAX_SKEW) return 'stale timestamp';
-	for (const [key, expiry] of seenSalts) {
-		if (expiry >= now) break;
-		seenSalts.delete(key);
-	}
-	const key = salt.toString('hex');
-	if (seenSalts.has(key)) return 'replayed salt';
-	seenSalts.set(key, now + 2 * MAX_SKEW);
-	return null;
-}
-
 function handleConnection(socket) {
 	const remote = `${socket.remoteAddress}:${socket.remotePort}`;
 	log.debug(`Connection from ${remote}`);
@@ -137,7 +119,7 @@ function handleConnection(socket) {
 	});
 
 	recvMessage(reader).then((request) => {
-		const rejected = checkReplay(request.ts, reader.salt);
+		const rejected = validateTsNonce(request.ts, reader.salt);
 		if (rejected) {
 			log.info(`Rejected request from ${remote}: ${rejected}`);
 			socket.destroy();

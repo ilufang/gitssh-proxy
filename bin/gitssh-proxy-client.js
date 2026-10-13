@@ -4,7 +4,7 @@
 const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_CLIENT_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
-const { sendMessage, recvMessage } = require('../lib/protocol');
+const { sendMessage, recvMessage, generateTsNonce } = require('../lib/protocol');
 const { buildProxyAuthorizedKeys, writeCache, readEtag } = require('../lib/authkeys');
 const { STDIN, STDOUT, STDERR, CONTROL, pipeChannel } = require('../lib/mux');
 
@@ -41,7 +41,7 @@ async function main() {
 
 	// Build bundled request
 	const request = {
-		ts: Math.floor(Date.now() / 1000),
+		ts: generateTsNonce(),
 		exec: { t: keyType, k: keyData, addr, origcmd },
 		getkey: {}
 	};

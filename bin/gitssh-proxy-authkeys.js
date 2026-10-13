@@ -5,7 +5,7 @@ const fs = require('fs');
 const { parseConfigFlag, loadConfig, resolveLogOptions, DEFAULT_CLIENT_CONFIG_PATH } = require('../lib/config');
 const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
-const { sendMessage, recvMessage } = require('../lib/protocol');
+const { sendMessage, recvMessage, generateTsNonce } = require('../lib/protocol');
 const { buildProxyAuthorizedKeys, writeCache, readEtag } = require('../lib/authkeys');
 
 const { configPath, logFile, logLevel } = parseConfigFlag(process.argv, DEFAULT_CLIENT_CONFIG_PATH);
@@ -27,7 +27,7 @@ async function main() {
 	try {
 		const { reader, writer, socket } = await connect(config.serverHost, config.serverPort, config.psk);
 
-		const request = { ts: Math.floor(Date.now() / 1000), getkey: {} };
+		const request = { ts: generateTsNonce(), getkey: {} };
 		if (etag) {
 			request.getkey.match = etag;
 		}

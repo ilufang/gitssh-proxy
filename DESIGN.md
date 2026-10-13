@@ -113,9 +113,10 @@ Notes:
 Control messages are JSON objects, each sent as one frame on channel 15.
 Multiple operations can be bundled as top-level keys in a single message.
 
-Every request carries `ts`, the client's Unix time in seconds. The server
-rejects a request when `|now - ts| > 60`. It also remembers each request's
-salt for the length of that window and rejects any salt it has already seen,
+Every request carries `ts`, the client's Unix time in milliseconds. The
+server rejects a request when `|now - ts| > 30000` (30 seconds). It also
+remembers each accepted request's salt until any request with that `ts`
+would be stale (twice the window) and rejects any salt it has already seen,
 so a captured connection cannot be replayed.
 
 After a successful `exec` response, the client sends stdin on channel 0 and
@@ -130,7 +131,7 @@ Retrieve the list of public keys the server will serve.
 **Request**
 
 ```json
-{"ts": 1760000000, "getkey": {"match": "<etag>"}}
+{"ts": 1760000000000, "getkey": {"match": "<etag>"}}
 ```
 
 - `match` (optional): the `etag` from the last full response, as stored in
@@ -167,7 +168,7 @@ command.
 **Request**
 
 ```json
-{"ts": 1760000000, "exec": {"t": "<key-type>", "k": "<key-data>", "addr": "<client IP>", "origcmd": "<SSH_ORIGINAL_COMMAND>"}}
+{"ts": 1760000000000, "exec": {"t": "<key-type>", "k": "<key-data>", "addr": "<client IP>", "origcmd": "<SSH_ORIGINAL_COMMAND>"}}
 ```
 
 - `t`: SSH key type (e.g., `ssh-rsa`, `ecdsa-sha2-nistp256`, `ssh-ed25519`)
@@ -204,7 +205,7 @@ The client exits with this code.
 The client typically sends `exec` and `getkey` together in a single message:
 
 ```json
-{"ts": 1760000000, "exec": {"t": "ssh-rsa", "k": "AAAA...", "addr": "203.0.113.5", "origcmd": "git-upload-pack 'user/repo.git'"}, "getkey": {"match": "abcdef..."}}
+{"ts": 1760000000000, "exec": {"t": "ssh-rsa", "k": "AAAA...", "addr": "203.0.113.5", "origcmd": "git-upload-pack 'user/repo.git'"}, "getkey": {"match": "abcdef..."}}
 ```
 
 The server processes both and returns a single combined response:

@@ -9,7 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { wrapTransport } = require('../lib/transport');
-const { sendMessage, recvMessage } = require('../lib/protocol');
+const { sendMessage, recvMessage, generateTsNonce } = require('../lib/protocol');
 const { STDIN, STDOUT, STDERR, CONTROL } = require('../lib/mux');
 
 const PSK = 'test-psk';
@@ -41,10 +41,6 @@ const SERVABLE_KEYS = [
 	{ t: 'ssh-ed25519', k: 'JJJJ0000' },
 	{ t: 'ssh-ed25519', k: 'KKKK1111' }
 ];
-
-function now() {
-	return Math.floor(Date.now() / 1000);
-}
 
 /** Collect stdout/stderr frames and the exit message until the server closes. */
 function collectOutput(reader) {
@@ -119,7 +115,7 @@ async function startServer(serverConfig, keys) {
 /** Send an exec request; return { response, out } where out is the collected output (if ok). */
 async function exec(server, k, { t = 'ssh-ed25519', addr = ADDR, origcmd = '' } = {}) {
 	const { reader, writer, socket } = await server.open();
-	await sendMessage(writer, { ts: now(), exec: { t, k, addr, origcmd } });
+	await sendMessage(writer, { ts: generateTsNonce(), exec: { t, k, addr, origcmd } });
 	const response = await recvMessage(reader);
 	if (!response.exec.ok) {
 		socket.destroy();
@@ -146,7 +142,7 @@ describe('integration', () => {
 
 	it('getkey returns only the servable keys and an etag', async () => {
 		const { reader, writer, socket } = await open();
-		await sendMessage(writer, { ts: now(), getkey: {} });
+		await sendMessage(writer, { ts: generateTsNonce(), getkey: {} });
 		const response = await recvMessage(reader);
 		assert.deepEqual(response.getkey.keys, SERVABLE_KEYS);
 		assert.equal(typeof response.getkey.etag, 'string');
@@ -156,7 +152,7 @@ describe('integration', () => {
 
 	it('getkey returns notmodified when etag matches', async () => {
 		const { reader, writer, socket } = await open();
-		await sendMessage(writer, { ts: now(), getkey: { match: etag } });
+		await sendMessage(writer, { ts: generateTsNonce(), getkey: { match: etag } });
 		const response = await recvMessage(reader);
 		assert.equal(response.getkey.notmodified, true);
 		socket.destroy();
@@ -164,7 +160,7 @@ describe('integration', () => {
 
 	it('exec with valid key streams stdout and exit code 0', async () => {
 		const { reader, writer } = await open();
-		await sendMessage(writer, { ts: now(), exec: { t: 'ssh-rsa', k: 'AAAA1111', addr: ADDR, origcmd: '' } });
+		await sendMessage(writer, { ts: generateTsNonce(), exec: { t: 'ssh-rsa', k: 'AAAA1111', addr: ADDR, origcmd: '' } });
 		const response = await recvMessage(reader);
 		assert.equal(response.exec.ok, true);
 
@@ -175,7 +171,7 @@ describe('integration', () => {
 
 	it('exec propagates stderr and non-zero exit code', async () => {
 		const { reader, writer } = await open();
-		await sendMessage(writer, { ts: now(), exec: { t: 'ssh-ed25519', k: 'DDDD4444', addr: ADDR, origcmd: '' } });
+		await sendMessage(writer, { ts: generateTsNonce(), exec: { t: 'ssh-ed25519', k: 'DDDD4444', addr: ADDR, origcmd: '' } });
 		assert.equal((await recvMessage(reader)).exec.ok, true);
 
 		const out = await collectOutput(reader);
@@ -185,7 +181,7 @@ describe('integration', () => {
 
 	it('exec relays stdin and its EOF to the child', async () => {
 		const { reader, writer } = await open();
-		await sendMessage(writer, { ts: now(), exec: { t: 'ssh-ed25519', k: 'CCCC3333', addr: ADDR, origcmd: '' } });
+		await sendMessage(writer, { ts: generateTsNonce(), exec: { t: 'ssh-ed25519', k: 'CCCC3333', addr: ADDR, origcmd: '' } });
 		assert.equal((await recvMessage(reader)).exec.ok, true);
 
 		const output = collectOutput(reader);
@@ -201,7 +197,7 @@ describe('integration', () => {
 	it('exec passes SSH_ORIGINAL_COMMAND to spawned process', async () => {
 		const { reader, writer } = await open();
 		await sendMessage(writer, {
-			ts: now(),
+			ts: generateTsNonce(),
 			exec: { t: 'ssh-ed25519', k: 'EEEE5555', addr: ADDR, origcmd: 'git-upload-pack repo.git' }
 		});
 		assert.equal((await recvMessage(reader)).exec.ok, true);
@@ -212,7 +208,7 @@ describe('integration', () => {
 
 	it('exec with invalid key returns error', async () => {
 		const { reader, writer, socket } = await open();
-		await sendMessage(writer, { ts: now(), exec: { t: 'ssh-rsa', k: 'INVALID', addr: ADDR, origcmd: '' } });
+		await sendMessage(writer, { ts: generateTsNonce(), exec: { t: 'ssh-rsa', k: 'INVALID', addr: ADDR, origcmd: '' } });
 		const response = await recvMessage(reader);
 		assert.equal(response.exec.error, 'Key not authorized');
 		socket.destroy();
@@ -221,7 +217,7 @@ describe('integration', () => {
 	it('bundled exec+getkey returns both responses', async () => {
 		const { reader, writer } = await open();
 		await sendMessage(writer, {
-			ts: now(),
+			ts: generateTsNonce(),
 			exec: { t: 'ssh-ed25519', k: 'BBBB2222', addr: ADDR, origcmd: '' },
 			getkey: { match: etag }
 		});
@@ -270,7 +266,7 @@ describe('integration', () => {
 	it('rejects a stale timestamp without sending anything', async () => {
 		const { writer, socket } = await open();
 		const received = bytesUntilClose(socket);
-		await sendMessage(writer, { ts: now() - 3600, getkey: {} });
+		await sendMessage(writer, { ts: generateTsNonce() - 3600 * 1000, getkey: {} });
 		assert.equal(await received, 0);
 	});
 
@@ -288,7 +284,7 @@ describe('integration', () => {
 		const origWrite = socket.write.bind(socket);
 		socket.write = (buf, cb) => { sent.push(buf); return origWrite(buf, cb); };
 		const { reader, writer } = wrapTransport(socket, PSK);
-		await sendMessage(writer, { ts: now(), getkey: {} });
+		await sendMessage(writer, { ts: generateTsNonce(), getkey: {} });
 		assert.ok((await recvMessage(reader)).getkey);
 		socket.destroy();
 
@@ -302,7 +298,7 @@ describe('integration', () => {
 	it('rejects a wrong psk without sending anything', async () => {
 		const { writer, socket } = await open('wrong-psk');
 		const received = bytesUntilClose(socket);
-		await sendMessage(writer, { ts: now(), getkey: {} });
+		await sendMessage(writer, { ts: generateTsNonce(), getkey: {} });
 		assert.equal(await received, 0);
 	});
 });
@@ -331,7 +327,7 @@ describe('integration with allowedCommands', () => {
 
 	it('getkey advertises only allowlisted, plain commands', async () => {
 		const { reader, writer, socket } = await server.open();
-		await sendMessage(writer, { ts: now(), getkey: {} });
+		await sendMessage(writer, { ts: generateTsNonce(), getkey: {} });
 		const response = await recvMessage(reader);
 		assert.deepEqual(response.getkey.keys.map(key => key.k), ['AAAA1111', 'BBBB2222', 'EEEE5555']);
 		socket.destroy();
