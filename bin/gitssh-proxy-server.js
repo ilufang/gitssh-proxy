@@ -8,7 +8,7 @@ const { createLogger } = require('../lib/log');
 const { wrapTransport } = require('../lib/transport');
 const { sendMessage, recvMessage } = require('../lib/protocol');
 const { parseAuthorizedKeys, findKey, hashKeys } = require('../lib/authkeys');
-const { STDOUT, STDERR, pipeChannel } = require('../lib/mux');
+const { STDIN, STDOUT, STDERR, pipeChannel } = require('../lib/mux');
 
 const { configPath, logFile, logLevel } = parseConfigFlag(process.argv, DEFAULT_SERVER_CONFIG_PATH);
 const config = loadConfig(configPath, 'server');
@@ -35,6 +35,24 @@ function reloadKeys() {
 	}
 }
 
+// Replay protection: requests must carry a fresh timestamp, and each
+// request salt is accepted only once within the timestamp window.
+const MAX_SKEW = 60; // seconds
+const seenSalts = new Map(); // salt hex -> expiry (insertion order = expiry order)
+
+function checkReplay(ts, salt) {
+	const now = Math.floor(Date.now() / 1000);
+	if (typeof ts !== 'number' || Math.abs(now - ts) > MAX_SKEW) return 'stale timestamp';
+	for (const [key, expiry] of seenSalts) {
+		if (expiry >= now) break;
+		seenSalts.delete(key);
+	}
+	const key = salt.toString('hex');
+	if (seenSalts.has(key)) return 'replayed salt';
+	seenSalts.set(key, now + 2 * MAX_SKEW);
+	return null;
+}
+
 function handleConnection(socket) {
 	const remote = `${socket.remoteAddress}:${socket.remotePort}`;
 	log.debug(`Connection from ${remote}`);
@@ -42,13 +60,22 @@ function handleConnection(socket) {
 	// Reload keys if file changed
 	reloadKeys();
 
-	const { reader, writer } = wrapTransport(socket);
+	// Nothing is written to the socket until the first request has
+	// authenticated and passed the replay check.
+	const { reader, writer } = wrapTransport(socket, config.psk);
 
 	socket.on('error', (err) => {
 		log.debug(`Socket error from ${remote}: ${err.message}`);
 	});
 
 	recvMessage(reader).then((request) => {
+		const rejected = checkReplay(request.ts, reader.salt);
+		if (rejected) {
+			log.info(`Rejected request from ${remote}: ${rejected}`);
+			socket.destroy();
+			return;
+		}
+
 		const response = {};
 
 		// Handle getkey
@@ -108,10 +135,13 @@ function spawnCommand(entry, origcmd, reader, writer, socket, remote) {
 		stdio: ['pipe', 'pipe', 'pipe']
 	});
 
-	// Pipe stdin; mux stdout and stderr into the single TCP writer.
-	// Wait for both channels to finish draining before ending the socket,
-	// so all mux frames are sent before the TCP FIN.
-	reader.pipe(child.stdin);
+	// Route STDIN frames to the child; stream stdout/stderr back as frames.
+	// Once both output channels have sent EOF, report the exit status.
+	reader.on('data', ({ channel, payload }) => {
+		if (channel !== STDIN) return;
+		if (payload) child.stdin.write(payload);
+		else child.stdin.end();
+	});
 	const stdoutDone = pipeChannel(child.stdout, writer, STDOUT).catch(() => {});
 	const stderrDone = pipeChannel(child.stderr, writer, STDERR).catch(() => {});
 
@@ -122,7 +152,9 @@ function spawnCommand(entry, origcmd, reader, writer, socket, remote) {
 
 	child.on('close', (code) => {
 		log.debug(`Child exited with code ${code} for ${remote}`);
-		Promise.all([stdoutDone, stderrDone]).then(() => socket.end());
+		Promise.all([stdoutDone, stderrDone])
+			.then(() => sendMessage(writer, { exit: { code: code ?? 1 } }))
+			.then(() => socket.end(), () => socket.destroy());
 	});
 
 	socket.on('close', () => {

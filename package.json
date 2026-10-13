@@ -1,6 +1,6 @@
 {
 	"name": "gitssh-proxy",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "SSH reverse proxy for git servers behind HTTP reverse proxies",
 	"bin": {
 		"gitssh-proxy-server": "./bin/gitssh-proxy-server.js",

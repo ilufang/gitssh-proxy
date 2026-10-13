@@ -6,7 +6,7 @@ For git services inside a container or VM exposed to the public through a
 reverse HTTP proxy, git+ssh becomes a problem since there is no equivalent
 "vhost" in SSH. This project solves it by manipulating the `authorized_keys`
 of the git user on the proxy host to transparently relay SSH connections to
-the actual git server over a lightweight TCP protocol.
+the actual git server over a lightweight encrypted TCP protocol.
 
 ## How it works
 
@@ -86,7 +86,8 @@ the default path with `-C /path/to/config.json`.
 {
   "listen": "0.0.0.0",
   "port": 9422,
-  "authkeysFile": "/home/git/.ssh/authorized_keys"
+  "authkeysFile": "/home/git/.ssh/authorized_keys",
+  "psk": "<shared secret>"
 }
 ```
 
@@ -97,7 +98,8 @@ the default path with `-C /path/to/config.json`.
   "serverHost": "127.0.0.1",
   "serverPort": 9422,
   "cacheFile": "/home/git/.ssh/authorized_keys",
-  "clientPath": "gitssh-proxy-client"
+  "clientPath": "gitssh-proxy-client",
+  "psk": "<shared secret>"
 }
 ```
 
@@ -106,16 +108,18 @@ the default path with `-C /path/to/config.json`.
 - **listen**: Bind address (default `0.0.0.0`)
 - **port**: Bind port (default `9422`)
 - **authkeysFile**: Path to the real `authorized_keys` file on the git server
+- **psk**: Preshared secret (required). Must match the client's `psk`.
 
 ### Client options
 
 - **serverHost**: Address of `gitssh-proxy-server` (default `127.0.0.1`)
 - **serverPort**: Port of `gitssh-proxy-server` (default `9422`)
 - **cacheFile**: Path to the cached `authorized_keys` on the proxy host
+- **psk**: Preshared secret (required). Must match the server's `psk`.
 
 ### Authkeys options
 
-- **serverHost**, **serverPort**: Same as client
+- **serverHost**, **serverPort**, **psk**: Same as client
 - **cacheFile**: Same as client
 - **clientPath**: Path to `gitssh-proxy-client` binary, used when rewriting
   the `command=` option (default `gitssh-proxy-client`)
@@ -125,11 +129,11 @@ the default path with `-C /path/to/config.json`.
 The proxy host's `/etc/ssh/sshd_config` needs the following for the git user:
 
 ```
+PermitUserEnvironment GITSSH_PROXY_*
 Match User git
     AuthorizedKeysFile /home/git/.ssh/authorized_keys
     AuthorizedKeysCommand /usr/local/bin/gitssh-proxy-authkeys
     AuthorizedKeysCommandUser git
-    PermitUserEnvironment GITSSH_PROXY_*
 ```
 
 `PermitUserEnvironment` is required because the transformed `authorized_keys`

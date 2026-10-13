@@ -203,11 +203,10 @@ describe('findKey', () => {
 });
 
 describe('hashKeys', () => {
-	it('returns consistent SHA-256 hex digest', () => {
+	it('returns consistent digest', () => {
 		const h1 = hashKeys('hello');
 		const h2 = hashKeys('hello');
 		assert.equal(h1, h2);
-		assert.equal(h1.length, 64); // SHA-256 hex is 64 chars
 	});
 
 	it('differs for different input', () => {

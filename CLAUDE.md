@@ -24,8 +24,9 @@ Three separate binaries, shared libraries in `lib/`:
 Shared modules:
 - `lib/config.js` — JSON config file loading (`-C` flag)
 - `lib/log.js` — stderr-only logger
-- `lib/transport.js` — transport pipeline (identity passthrough, PSK-ready)
-- `lib/protocol.js` — NDJSON framing (sendMessage/recvMessage)
+- `lib/transport.js` — AES-128-GCM encrypted frame codec (PSK, per-direction salt)
+- `lib/mux.js` — channel numbers + `pipeChannel` (data frames, then EOF)
+- `lib/protocol.js` — JSON control messages on channel 15 (sendMessage/recvMessage)
 - `lib/authkeys.js` — authorized_keys parsing, serialization, transformation
 - `lib/connection.js` — TCP connect + transport wrapping
 
@@ -33,18 +34,22 @@ Shared modules:
 
 - Zero external dependencies. Only Node.js builtins.
 - All logging goes to stderr, never stdout (stdout is the data channel).
-- Transport abstraction: all protocol code uses `{reader, writer}` from
-  `wrapTransport()`, never the raw socket for data I/O.
-- `recvMessage()` uses a manual line reader (not `readline`) to avoid
-  consuming bytes beyond the `\n` delimiter — critical for the raw stdio
-  transition after `exec`.
-- Config via JSON file at `/etc/gitssh-proxy/config.json` (override `-C`).
+- Transport abstraction: all I/O goes through `{reader, writer}` from
+  `wrapTransport(socket, psk)`, never the raw socket. `writer.send(channel,
+  buf)` / `writer.sendEof(channel)` write frames; `reader` is an object-mode
+  stream of `{channel, payload}` (`payload === null` means EOF).
+- The server writes nothing until the first request authenticates and passes
+  the `ts`/salt replay check.
+- Config via JSON files (`/etc/gitssh-proxy/server.json` / `client.json`,
+  override `-C`). `psk` is required.
 - Tests use Node.js built-in `node:test` and `node:assert`.
 
 ## Protocol reference
 
 See DESIGN.md. Key points:
-- NDJSON over TCP. One JSON line per message.
-- After successful `exec` response, stream becomes raw binary stdio.
+- Encrypted frames over TCP; header is u32 LE `(channel << 28) | length`.
+  Channels: 0 stdin, 1 stdout, 2 stderr, 15 control (one JSON object/frame).
+- Requests carry `ts`. After `exec` succeeds, stdio flows on channels 0–2,
+  then the server sends `{"exit": {"code": n}}`.
 - `getkey` uses SHA-256 caching. `exec` re-authenticates the SSH key.
 - Multiple operations can be bundled in a single message.

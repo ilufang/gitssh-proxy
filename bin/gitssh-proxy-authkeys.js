@@ -25,9 +25,9 @@ async function main() {
 
 	let keysRaw;
 	try {
-		const { reader, writer, socket } = await connect(config.serverHost, config.serverPort);
+		const { reader, writer, socket } = await connect(config.serverHost, config.serverPort, config.psk);
 
-		const request = { getkey: {} };
+		const request = { ts: Math.floor(Date.now() / 1000), getkey: {} };
 		if (cacheHash) {
 			request.getkey.match = cacheHash;
 		}

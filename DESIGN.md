@@ -26,44 +26,80 @@ injected into the transformed `authorized_keys` entries. This requires
 
 ## Transport layer
 
-The protocol runs over TCP. The transport layer is a pipeline of stream
-transforms applied to the raw socket:
+The protocol runs over TCP. Every byte in both directions is carried in
+encrypted, authenticated frames using AES-128-GCM, keyed from a preshared
+secret (`psk` in both config files). The two directions are independent
+streams, each with its own salt, key and nonce counter.
 
 ```
-Application  <-->  Transport Transform  <-->  TCP Socket
+stream: [salt 16B] [frame] [frame] ...
+
+frame:  seal(header) seal(payload)    length > 0
+        seal(header)                  length = 0 (EOF)
+
+header  = u32 little-endian: (channel << 28) | length
+seal(m) = AES-128-GCM ciphertext of m (same length as m) || 16-byte tag
 ```
 
-Currently the transform is identity (passthrough). When transport security is
-needed (e.g., proxy and server on different networks), a PSK-based cipher
-transform can be inserted into the pipeline without changes to the application
-layer. All application code reads from and writes to the `{reader, writer}`
-interface returned by the transport, never the raw socket.
+**Key derivation.** The sender picks a random 16-byte salt and sends it
+in clear as the first bytes of its stream. Both sides then derive the
+direction's key:
+
+```
+key = HKDF-SHA256(ikm = UTF-8 bytes of psk, salt = salt, info = "gitssh-proxy-subkey", length = 16)
+```
+
+**Nonces.** Each direction keeps a 12-byte nonce. It starts at all zeros
+and is incremented as a little-endian integer after every `seal` (sender)
+or `open` (receiver). The header and the payload are separate `seal`
+operations, so a data frame uses two nonces and an EOF frame uses one. No
+additional authenticated data is used.
+
+**Receiving.** The receiver reads the 16-byte salt, then loops:
+
+1. Read 4 + 16 bytes and open the header. Channel = `header >>> 28`,
+   length = `header & 0x0FFFFFFF`.
+2. If length is 0, it is an EOF for that channel. Go to 1.
+3. Otherwise read length + 16 bytes, open the payload, and deliver it.
+
+Notes:
+
+- The header is authenticated before the payload is read, so the length field
+  can be trusted before buffering. The maximum payload is `0x0FFFFFFF` bytes.
+  Every message fits in a single frame, so frames are never reassembled.
+- The header is authenticated before the payload is read, so the length field
+  can be trusted before buffering. The maximum payload is `0x0FFFFFFF` bytes.
+  Every message fits in a single frame, so frames are never reassembled.
+- A frame with length 0 is an authenticated EOF for its channel. No payload
+  chunk follows it, and the TCP connection stays open.
+- Any authentication failure closes the connection.
+- The server sends nothing, not even its salt, until the client's first frame
+  has authenticated and passed the replay check (see below). An
+  unauthenticated peer gets a silent close.
+
+### Channels
+
+| Channel | Direction       | Content                          |
+|---------|-----------------|----------------------------------|
+| 0       | client → server | stdin of the spawned command     |
+| 1       | server → client | stdout of the spawned command    |
+| 2       | server → client | stderr of the spawned command    |
+| 15      | both            | control messages (one JSON object per frame) |
 
 ## Application protocol
 
-Newline-delimited JSON (NDJSON) is used for message framing. Each message is
-a single JSON object terminated by `\n`. Multiple operations can be bundled as
-top-level keys in a single message.
+Control messages are JSON objects, each sent as one frame on channel 15.
+Multiple operations can be bundled as top-level keys in a single message.
 
-After a successful `exec` response, the TCP stream transitions from NDJSON to
-a multiplexed binary stream carrying both stdout and stderr of the spawned
-process. This means the JSON message reader must not consume any bytes beyond
-the terminating newline.
+Every request carries `ts`, the client's Unix time in seconds. The server
+rejects a request when `|now - ts| > 60`. It also remembers each request's
+salt for the length of that window and rejects any salt it has already seen,
+so a captured connection cannot be replayed.
 
-#### Stream multiplexing
-
-After the `exec` handshake, the stream uses a simple frame format:
-
-```
-[1-byte channel][4-byte big-endian uint32 length][payload bytes]
-```
-
-- Channel `0x01` — stdout
-- Channel `0x02` — stderr
-
-The client demultiplexes frames and routes them to its own `stdout`/`stderr`.
-The server-to-client direction is multiplexed; the client-to-server direction
-(stdin) remains raw binary.
+After a successful `exec` response, the client sends stdin on channel 0 and
+ends it with an EOF frame. The server streams stdout and stderr on channels 1
+and 2, sends an EOF frame for each, then sends the `exit` message on channel
+15 and closes the connection.
 
 ### getkey
 
@@ -72,10 +108,10 @@ Retrieve the server's `authorized_keys`.
 **Request**
 
 ```json
-{"getkey": {"match": "<sha-256 hex digest of local cache>"}}
+{"ts": 1760000000, "getkey": {"match": "<sha-256 digest of local cache>"}}
 ```
 
-- `match` (optional): SHA-256 hex digest of the local `authorized_keys` cache
+- `match` (optional): SHA-256 digest of the local `authorized_keys` cache
   file content. If omitted, the server always returns the full keys.
 
 **Response**
@@ -107,7 +143,7 @@ is informational and not used for command execution (prevents injection).
 **Request**
 
 ```json
-{"exec": {"t": "<key-type>", "k": "<key-data>", "cmd": "<forcecommand>", "origcmd": "<SSH_ORIGINAL_COMMAND>"}}
+{"ts": 1760000000, "exec": {"t": "<key-type>", "k": "<key-data>", "cmd": "<forcecommand>", "origcmd": "<SSH_ORIGINAL_COMMAND>"}}
 ```
 
 - `t`: SSH key type (e.g., `ssh-rsa`, `ecdsa-sha2-nistp256`, `ssh-ed25519`)
@@ -119,7 +155,7 @@ is informational and not used for command execution (prevents injection).
 
 **Response**
 
-On success (stream transitions to raw stdio after this line):
+On success (stdio streaming on channels 0–2 begins):
 
 ```json
 {"exec": {"ok": true}}
@@ -131,12 +167,20 @@ On failure:
 {"exec": {"error": "<reason>"}}
 ```
 
+When the command finishes, after the EOF frames for stdout and stderr:
+
+```json
+{"exit": {"code": 0}}
+```
+
+The client exits with this code.
+
 ### Bundled requests
 
 The client typically sends `exec` and `getkey` together in a single message:
 
 ```json
-{"exec": {"t": "ssh-rsa", "k": "AAAA...", "cmd": "gogs serv key-1", "origcmd": "git-upload-pack 'user/repo.git'"}, "getkey": {"match": "abcdef..."}}
+{"ts": 1760000000, "exec": {"t": "ssh-rsa", "k": "AAAA...", "cmd": "gogs serv key-1", "origcmd": "git-upload-pack 'user/repo.git'"}, "getkey": {"match": "abcdef..."}}
 ```
 
 The server processes both and returns a single combined response:
@@ -145,8 +189,7 @@ The server processes both and returns a single combined response:
 {"exec": {"ok": true}, "getkey": {"notmodified": true}}
 ```
 
-After this response, the stream transitions to raw binary stdio (if exec
-succeeded). The client uses the `getkey` result to update its cache
+After this response, stdio streaming begins (if exec succeeded). The client uses the `getkey` result to update its cache
 asynchronously.
 
 ## authorized_keys transformation

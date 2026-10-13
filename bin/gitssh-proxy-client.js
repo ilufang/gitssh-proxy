@@ -7,7 +7,7 @@ const { createLogger } = require('../lib/log');
 const { connect } = require('../lib/connection');
 const { sendMessage, recvMessage } = require('../lib/protocol');
 const { parseAuthorizedKeys, serializeAuthorizedKeys, transformForProxy, hashKeys } = require('../lib/authkeys');
-const { demux } = require('../lib/mux');
+const { STDIN, STDOUT, STDERR, CONTROL, pipeChannel } = require('../lib/mux');
 
 const { configPath, logFile, logLevel, remainingArgs } = parseConfigFlag(process.argv, DEFAULT_CLIENT_CONFIG_PATH);
 const config = loadConfig(configPath, 'client');
@@ -39,10 +39,18 @@ try {
 }
 
 async function main() {
-	const { reader, writer, socket } = await connect(config.serverHost, config.serverPort);
+	const { reader, writer, socket } = await connect(config.serverHost, config.serverPort, config.psk);
+
+	let exiting = false;
+	socket.on('error', (err) => {
+		if (exiting) return;
+		log.error(`Connection error: ${err.message}`);
+		process.exit(1);
+	});
 
 	// Build bundled request
 	const request = {
+		ts: Math.floor(Date.now() / 1000),
 		exec: { t: keyType, k: keyData, cmd, origcmd },
 		getkey: {}
 	};
@@ -73,27 +81,34 @@ async function main() {
 		process.exit(1);
 	}
 
-	// Keep socket half-open: we need to keep reading from the server
-	// (demux) even after stdin ends. allowHalfOpen lets us send our FIN
-	// without tearing down the receive side.
-	socket.allowHalfOpen = true;
-
-	// Stream mode: demux stdout+stderr from reader, pipe stdin to writer
-	process.stdin.pipe(writer, { end: false });
-	process.stdin.on('end', () => {
-		// Signal EOF to server without closing the receive side
-		socket.end();
+	// Stream mode: stdin goes out on STDIN (then EOF); stdout/stderr come
+	// back on their channels until the server sends the exit status.
+	pipeChannel(process.stdin, writer, STDIN).catch((err) => {
+		log.debug(`stdin relay failed: ${err.message}`);
 	});
 
-	demux(reader, process.stdout, process.stderr).then(() => {
-		process.exit(0);
-	}).catch((err) => {
-		log.error(`Stream error: ${err.message}`);
+	reader.on('data', ({ channel, payload }) => {
+		if (!payload) return; // EOF on stdout/stderr: nothing to do
+		if (channel === STDOUT) {
+			process.stdout.write(payload);
+		} else if (channel === STDERR) {
+			process.stderr.write(payload);
+		} else if (channel === CONTROL) {
+			const msg = JSON.parse(payload.toString('utf8'));
+			if (msg.exit) {
+				exiting = true;
+				// Flush stdout before exiting
+				process.stdout.write('', () => process.exit(msg.exit.code));
+			}
+		}
+	});
+	reader.on('end', () => {
+		if (exiting) return;
+		log.error('Connection closed before exit status');
 		process.exit(1);
 	});
-
-	socket.on('error', (err) => {
-		log.error(`Connection error: ${err.message}`);
+	reader.on('error', (err) => {
+		log.error(`Stream error: ${err.message}`);
 		process.exit(1);
 	});
 }
